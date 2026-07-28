@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>个人知识中枢</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <a class="brand" href="/">
+        <span class="brand-mark">知</span>
+        <span>
+          <strong>个人知识中枢</strong>
+          <small>Obsidian · 本机运行</small>
+        </span>
+      </a>
+      <div class="top-actions">
+        <span class="privacy"><i></i> 资料不离开本机</span>
+        <button class="ghost" id="openVault">打开知识库</button>
+      </div>
+    </header>
+
+    <main>
+      <section class="hero">
+        <div class="eyebrow">ONE LINK IN · KNOWLEDGE OUT</div>
+        <h1>把链接丢进来，<br><em>剩下的交给系统。</em></h1>
+        <p>公众号、普通网页、小红书、飞书或本地文件都可以。系统会提取正文、整理价值、建立关联并写进你的 Obsidian。</p>
+      </section>
+
+      <section class="workspace">
+        <article class="submit-card">
+          <div class="card-heading">
+            <span class="step">01</span>
+            <div>
+              <h2>提交内容</h2>
+              <p>一次可粘贴多条链接，也可以保留微信分享文案。</p>
+            </div>
+          </div>
+          <textarea id="linkInput" autofocus placeholder="在这里粘贴链接，例如：&#10;https://mp.weixin.qq.com/s/..."></textarea>
+          <div class="route-row">
+            <label class="route active">
+              <input type="radio" name="route" value="auto" checked>
+              <span>自动判断</span>
+            </label>
+            <label class="route">
+              <input type="radio" name="route" value="router">
+              <span>立即提正文</span>
+            </label>
+            <label class="route">
+              <input type="radio" name="route" value="share">
+              <span>安全队列</span>
+            </label>
+            <label class="route">
+              <input type="radio" name="route" value="archive">
+              <span>历史归档</span>
+            </label>
+          </div>
+          <div class="submit-options">
+            <label class="check">
+              <input type="checkbox" id="subscribe">
+              <span>以后也追更这个公众号</span>
+            </label>
+            <button class="primary" id="submitBtn">
+              <span>交给知识库</span>
+              <b>→</b>
+            </button>
+          </div>
+          <div class="notice" id="submitNotice" hidden></div>
+        </article>
+
+        <article class="local-card">
+          <div class="card-heading">
+            <span class="step">02</span>
+            <div>
+              <h2>导入本地资料</h2>
+              <p>粘贴一个文件或文件夹的完整路径，原文件保持不变。</p>
+            </div>
+          </div>
+          <input id="localPath" class="path-input" type="text" placeholder="例如：C:\\Users\\你的用户名\\Documents\\我的备忘录">
+          <div class="file-types">Markdown · TXT · HTML · JSON · Word · PDF</div>
+          <div class="local-actions">
+            <span>最多 500 个文件</span>
+            <button class="primary" id="localImportBtn">
+              <span>读入知识星球</span>
+              <b>→</b>
+            </button>
+          </div>
+          <div class="notice" id="localNotice" hidden></div>
+        </article>
+
+        <aside class="flow-card">
+          <div class="card-heading compact">
+            <span class="step">03</span>
+            <div>
+              <h2>后台会做什么</h2>
+              <p>不需要你手动整理。</p>
+            </div>
+          </div>
+          <ol class="pipeline">
+            <li>
+              <span class="pipeline-icon">↗</span>
+              <div><strong>识别来源</strong><small>公众号 / 网页 / 小红书 / 飞书</small></div>
+            </li>
+            <li>
+              <span class="pipeline-icon">≋</span>
+              <div><strong>提取与清洗</strong><small>正文、作者、时间、图片本地化</small></div>
+            </li>
+            <li>
+              <span class="pipeline-icon">◇</span>
+              <div><strong>写入 Obsidian</strong><small>来源库 + Inbox 备份记录</small></div>
+            </li>
+          </ol>
+          <div class="vault-target">
+            <span>最终落点</span>
+            <strong>10_Sources → 20_Knowledge</strong>
+          </div>
+        </aside>
+      </section>
+
+      <section class="systems">
+        <div class="section-title">
+          <div>
+            <span class="eyebrow">FOUR ENGINES · ONE ENTRANCE</span>
+            <h2>已经接通的四套能力</h2>
+          </div>
+          <button class="text-button" id="refreshStatus">刷新状态 ↻</button>
+        </div>
+        <div class="system-grid">
+          <article class="system-card">
+            <div class="system-top"><span class="system-no">A</span><span class="status-pill" id="stsStatus">检查中</span></div>
+            <h3>Share to Save</h3>
+            <p>普通网页抓取和所有失败任务的安全兜底。Obsidian 打开后自动消费队列。</p>
+            <small id="stsDetail">正在读取插件状态…</small>
+          </article>
+          <article class="system-card">
+            <div class="system-top"><span class="system-no">B</span><span class="status-pill" id="archiverStatus">检查中</span></div>
+            <h3>公众号归档器</h3>
+            <p>从一篇文章识别公众号，补齐历史文章，并可持续追更。</p>
+            <button class="inline-action" id="archiverLogin">一次性扫码登录</button>
+            <div class="qr-panel" id="qrPanel" hidden>
+              <div class="qr-frame">
+                <img id="qrImage" alt="微信公众平台登录二维码">
+              </div>
+              <strong id="qrTitle">正在生成二维码…</strong>
+              <small id="qrHint">请稍候，不要关闭当前页面。</small>
+              <button class="text-button" id="hideQr">暂时收起</button>
+            </div>
+          </article>
+          <article class="system-card warning-card">
+            <div class="system-top"><span class="system-no">C</span><span class="status-pill safe" id="routerStatus">配置中</span></div>
+            <h3>微信“我看过的”</h3>
+            <p>只读监听微信内置浏览器中新打开的公众号文章，自动取得标准链接并写入 Obsidian；旧浏览记录不会批量导入。</p>
+            <small id="routerDetail">正在建立浏览历史基线…</small>
+          </article>
+          <article class="system-card">
+            <div class="system-top"><span class="system-no">D</span><span class="status-pill" id="knowledgeStatus">检查中</span></div>
+            <h3>精简知识流水线</h3>
+            <p>正文写成 Markdown；图片先由 Codex 视觉识别，本地 OCR 只作兜底，并自动更新分类、双链与 AI 索引。</p>
+            <small id="knowledgeDetail">正在读取知识库验收报告…</small>
+          </article>
+        </div>
+      </section>
+
+      <section class="knowledge-search">
+        <div class="section-title">
+          <div>
+            <span class="eyebrow">LOCAL AI CONTEXT</span>
+            <h2>搜索你的知识网络</h2>
+            <p class="section-hint">按身份检索：个人第二大脑表达你的判断，专业研究脑提供外部方法，企业资料只在企业范围内使用。</p>
+          </div>
+        </div>
+        <div class="search-row">
+          <input id="knowledgeQuery" type="search" placeholder="例如：机器人、Agent、清洁能源">
+          <select id="knowledgeScope" aria-label="选择知识库范围">
+            <option value="all">全部语料</option>
+            <option value="personal">我的第二大脑</option>
+            <option value="professional">专业研究脑</option>
+            <option value="enterprise">企业知识脑</option>
+            <option value="archive">原文证据库</option>
+          </select>
+          <button class="primary" id="knowledgeSearch"><span>搜索知识库</span><b>→</b></button>
+        </div>
+        <div id="searchResults" class="search-results"></div>
+      </section>
+
+      <section class="jobs">
+        <div class="section-title">
+          <div>
+            <span class="eyebrow">RECENT ACTIVITY</span>
+            <h2>最近处理</h2>
+            <p class="section-hint">系统会把资讯压缩为速览、把见解和方法提炼成重点。读完可标“已学会”，特别有价值可标“设为重点”，低价值内容直接回收。</p>
+          </div>
+          <span class="muted" id="jobCount">0 条</span>
+        </div>
+        <div id="jobList" class="job-list">
+          <div class="empty">还没有任务。粘贴第一条链接试试。</div>
+        </div>
+      </section>
+    </main>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>
