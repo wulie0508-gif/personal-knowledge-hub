@@ -1,0 +1,8 @@
+{
+  "vault_path": "~/Documents/Obsidian Vault",
+  "port": 8765,
+  "runtime_mode": "local_first",
+  "default_query_scope": "all",
+  "invasive_router_enabled": false,
+  "share_to_save_output": "intermediate/share-to-save"
+}
