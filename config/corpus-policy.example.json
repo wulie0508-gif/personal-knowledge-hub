@@ -1,0 +1,20 @@
+{
+  "personal_memory": {
+    "description": "User-authored, read, annotated or explicitly endorsed material.",
+    "persona_influence_requires": ["self_authored", "explicit_user_feedback"],
+    "default_retrieval_weight": 1.45
+  },
+  "professional_reference": {
+    "description": "External researchers, favorite bloggers, papers and reports.",
+    "represents_user": false,
+    "default_retrieval_weight": 1.0
+  },
+  "enterprise_internal": {
+    "description": "Private organization facts, policy and project material.",
+    "default_retrieval_weight": 1.35
+  },
+  "source_archive": {
+    "description": "Raw material kept for traceability and on-demand evidence retrieval.",
+    "default_retrieval_weight": 0.2
+  }
+}
