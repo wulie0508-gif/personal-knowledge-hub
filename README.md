@@ -12,6 +12,7 @@
 [![Markdown](https://img.shields.io/badge/Markdown-First-111827?logo=markdown&logoColor=white)](https://www.markdownguide.org/)
 [![Local First](https://img.shields.io/badge/Privacy-Local--First-16A34A)](#privacy--安全边界)
 [![Windows](https://img.shields.io/badge/Windows-Ready-0078D4?logo=windows11&logoColor=white)](#quick-start--快速开始)
+[![License](https://img.shields.io/badge/License-MIT-F59E0B.svg)](LICENSE)
 
 </div>
 
@@ -163,7 +164,7 @@ personal-knowledge-hub/
 
 ## License
 
-当前仓库尚未选择正式的开源许可证。在许可证确定前，代码可公开阅读，但复用、分发和商用权限仍由仓库所有者保留。
+本项目采用 [MIT License](LICENSE)。你可以使用、复制、修改、合并、发布、分发及商业化本项目，但须保留原始版权与许可声明。软件按“原样”提供，作者不承担使用风险或担保责任。
 
 ---
 
