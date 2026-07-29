@@ -15,6 +15,7 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import knowledge_schema
+import personal_context
 import runtime_config
 
 
@@ -104,6 +105,7 @@ class Note:
     engagement_status: str
     stance: str
     persona_influence: float
+    identity_explicit: bool
     corpus_tier: str
     retrieval_weight: float
     body: str
@@ -296,10 +298,13 @@ def read_notes(article_roots: list[Path]) -> list[Note]:
             priority = str(_field(text, "knowledge_priority", "参考"))
             curation_status = str(_field(text, "curation_status", "pending"))
             value_summary, highlights = _curation_payload(text)
+            explicit_namespace = knowledge_schema.normalize_namespace(
+                _field(text, "corpus_namespace")
+            )
             corpus_namespace = knowledge_schema.infer_namespace(
                 platform=platform,
                 path_text=str(path),
-                explicit=_field(text, "corpus_namespace"),
+                explicit=explicit_namespace,
                 is_raw_evidence=is_raw_wechat and curation_status != "complete",
             )
             identity = knowledge_schema.identity_metadata(
@@ -345,6 +350,7 @@ def read_notes(article_roots: list[Path]) -> list[Note]:
                     engagement_status=str(identity["engagement_status"]),
                     stance=str(identity["stance"]),
                     persona_influence=float(identity["persona_influence"]),
+                    identity_explicit=bool(explicit_namespace),
                     corpus_tier=corpus_tier,
                     retrieval_weight=retrieval_weight,
                     body=body,
@@ -496,7 +502,936 @@ def related_notes(notes: list[Note]) -> dict[Path, list[tuple[Note, float, list[
         )[:MAX_CANDIDATE_TOKENS]
         for token in informative_tokens:
             for target_path in token_postings.get(token, []):
-    …10081 tokens truncated…                continue
+                if target_path != source.path:
+                    candidate_votes[target_path] += 1
+        for concept in source.concepts:
+            added = 0
+            for target_path in concept_postings.get(concept, []):
+                if target_path == source.path:
+                    continue
+                candidate_votes[target_path] += 3
+                added += 1
+                if added >= 60:
+                    break
+            # Always consider the user's own project/method notes for a
+            # semantically matching external source. Without this dedicated
+            # posting list, thousands of Tencent articles crowd the smaller
+            # local corpus out of the candidate window.
+            if source.corpus_namespace != knowledge_schema.PERSONAL_MEMORY:
+                for target_path in project_concept_postings.get(concept, []):
+                    if target_path != source.path:
+                        candidate_votes[target_path] += 8
+        for target_path in explicit_links[source.path]:
+            candidate_votes[target_path] += 100
+        for source_path in reverse_explicit_links[source.path]:
+            candidate_votes[source_path] += 100
+        candidate_paths = [
+            path
+            for path, _ in candidate_votes.most_common(MAX_CANDIDATES)
+            if path in vectors
+        ]
+        for target_path in candidate_paths:
+            target = note_by_path[target_path]
+            target_vector = vectors[target.path]
+            shared = set(source_vector).intersection(target_vector)
+            denominator = norms[source.path] * norms[target.path]
+            cosine = (
+                sum(source_vector[token] * target_vector[token] for token in shared)
+                / denominator
+                if denominator
+                else 0.0
+            )
+            score = cosine
+            reasons: list[str] = []
+            source_points_to_target = target.path in explicit_links[source.path]
+            target_points_to_source = source.path in explicit_links[target.path]
+            if source_points_to_target or target_points_to_source:
+                score += 0.65
+                reasons.append(
+                    "显式知识链" if source_points_to_target else "被引用知识链"
+                )
+            if source_points_to_target and target_points_to_source:
+                score += 0.12
+                reasons.append("双向引用")
+            shared_concepts = sorted(set(source.concepts).intersection(target.concepts))
+            if shared_concepts:
+                score += min(0.26, 0.12 + 0.04 * len(shared_concepts))
+                reasons.append("共同概念：" + "、".join(shared_concepts[:3]))
+            if source.category == target.category and source.category != "其他":
+                score += 0.04
+                reasons.append(f"同属{source.category}")
+            keywords = sorted(
+                (
+                    token
+                    for token in shared
+                    if re.search(r"[A-Za-z]", token) or len(token) >= 3
+                ),
+                key=lambda token: source_vector[token] * target_vector[token],
+                reverse=True,
+            )[:3]
+            if keywords:
+                reasons.append("共同主题：" + "、".join(keywords))
+            explicit = source_points_to_target or target_points_to_source
+            project_pair = (
+                source.corpus_namespace != target.corpus_namespace
+                and knowledge_schema.PERSONAL_MEMORY
+                in {source.corpus_namespace, target.corpus_namespace}
+            )
+            external_note = (
+                target
+                if source.corpus_namespace == knowledge_schema.PERSONAL_MEMORY
+                else source
+            )
+            if (
+                project_pair
+                and external_note.curation_status != "complete"
+                and not explicit
+            ):
+                # Raw source text remains searchable, but a high-meaning edge
+                # into the user's own methods/projects requires article-level
+                # curation and an explicit evidence boundary first.
+                continue
+            kind = relation_type(
+                source,
+                target,
+                explicit=explicit,
+                shared_concepts=shared_concepts,
+            )
+            reasons.insert(0, kind)
+            if source.account and source.account != target.account:
+                reasons.append(f"来源对照：{source.account} ↔ {target.account}")
+                if len(shared_concepts) >= 2 and cosine >= 0.10:
+                    score += 0.02
+            elif source.account:
+                reasons.append(f"同一来源：{source.account}")
+            is_project_migration = project_pair
+            strong_project_semantics = (
+                len(shared_concepts) >= 2
+                or len(shared_concepts) == 1
+                and bool(keywords)
+                and cosine >= 0.10
+            )
+            if is_project_migration and strong_project_semantics:
+                # The external article has already passed article-level Codex
+                # curation. Two independent concept matches therefore form a
+                # conservative "possible application" edge; a single concept
+                # still needs a discriminating topic and lexical similarity.
+                score += 0.08
+            elif is_project_migration and shared_concepts and cosine >= 0.10:
+                score += 0.05
+            semantic_evidence = (
+                bool(shared_concepts)
+                and cosine >= 0.10
+                or len(keywords) >= 2
+                and cosine >= 0.18
+                or is_project_migration
+                and strong_project_semantics
+                or is_project_migration
+                and bool(shared_concepts)
+                and len(keywords) >= 2
+                and cosine >= 0.10
+            )
+            # Cross-domain links shape how an AI interprets the user. Keep them
+            # out of the formal graph unless the evidence is materially
+            # stronger than ordinary document similarity. Weak candidates may
+            # still be found through retrieval without becoming persona edges.
+            minimum_score = 0.42 if project_pair else 0.30
+            project_edge_allowed = (
+                not project_pair or strong_project_semantics
+            )
+            if explicit or (
+                score >= minimum_score
+                and semantic_evidence
+                and project_edge_allowed
+            ):
+                candidates.append((target, score, reasons))
+        result[source.path] = diversify(source, candidates)
+    return result
+
+
+def _wikilink(path: Path, vault: Path, title: str) -> str:
+    relative = os.path.relpath(path, vault).replace("\\", "/")
+    return f"[[{relative[:-3]}|{title}]]"
+
+
+def write_note_links(
+    notes: list[Note],
+    links: dict[Path, list[tuple[Note, float, list[str]]]],
+    vault: Path,
+) -> int:
+    link_count = 0
+    for note in notes:
+        text = note.path.read_text(encoding="utf-8", errors="replace")
+        text = re.sub(
+            rf"\n?{re.escape(START_MARKER)}.*?{re.escape(END_MARKER)}\n?",
+            "\n",
+            text,
+            flags=re.DOTALL,
+        ).rstrip()
+        rows = [START_MARKER, "## 知识关联", ""]
+        if note.corpus_tier in GRAPH_TIERS and note.concepts:
+            concept_links = " · ".join(
+                f"[[20_Knowledge/核心概念/{concept}|{concept}]]"
+                for concept in note.concepts
+            )
+            rows += [f"- 概念节点：{concept_links}", ""]
+        for target, score, reasons in links.get(note.path, []):
+            rows.append(
+                f"- {_wikilink(target.path, vault, target.title)}"
+                f" — {'；'.join(reasons)}（关联度 {score:.2f}）"
+            )
+            link_count += 1
+        if not links.get(note.path):
+            rows.append("- 暂无足够强的关联；后续文章进入后会自动重算。")
+        rows += ["", END_MARKER]
+        note.path.write_text(text + "\n\n" + "\n".join(rows) + "\n", encoding="utf-8")
+    return link_count
+
+
+def write_topic_maps(notes: list[Note], vault: Path) -> int:
+    topic_root = vault / "20_Knowledge" / "知识主题"
+    topic_root.mkdir(parents=True, exist_ok=True)
+    grouped: dict[str, list[Note]] = defaultdict(list)
+    for note in notes:
+        if note.corpus_tier not in GRAPH_TIERS:
+            continue
+        grouped[note.category or "其他"].append(note)
+    expected: set[Path] = set()
+    for category, items in grouped.items():
+        safe = re.sub(r'[\\/:*?"<>|]', " ", category).strip() or "其他"
+        path = topic_root / f"{safe}.md"
+        expected.add(path)
+        rows = [
+            "---",
+            'type: "topic-map"',
+            f"topic: {json.dumps(category, ensure_ascii=False)}",
+            f"updated_at: {json.dumps(now_text(), ensure_ascii=False)}",
+            "---",
+            "",
+            f"# {category}",
+            "",
+            f"> 自动聚合 {len(items)} 份跨来源资料；内容增删后自动更新。",
+            "",
+        ]
+        ranked_items = sorted(
+            items,
+            key=lambda value: (
+                -value.retrieval_weight,
+                -value.value_score,
+                -value.quality,
+                value.title,
+            ),
+        )
+        for item in ranked_items[:60]:
+            rows.append(
+                f"- {_wikilink(item.path, vault, item.title)}"
+                f" — {item.account or '未知公众号'} · {item.knowledge_type}"
+                f" · {item.value_score or item.quality}/100"
+            )
+        if len(ranked_items) > 60:
+            rows += [
+                "",
+                f"> 仅展示最高价值的 60 篇；其余 {len(ranked_items) - 60} 篇仍可由本地索引检索。",
+            ]
+        path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    for stale in topic_root.glob("*.md"):
+        if stale not in expected:
+            stale.unlink()
+    return len(grouped)
+
+
+def write_concept_maps(notes: list[Note], vault: Path) -> int:
+    concept_root = vault / "20_Knowledge" / "核心概念"
+    concept_root.mkdir(parents=True, exist_ok=True)
+    grouped: dict[str, list[Note]] = defaultdict(list)
+    for note in notes:
+        if note.corpus_tier not in GRAPH_TIERS:
+            continue
+        for concept in note.concepts:
+            grouped[concept].append(note)
+    expected: set[Path] = set()
+    for concept, items in grouped.items():
+        safe = re.sub(r'[\\/:*?"<>|]', " ", concept).strip() or "其他"
+        path = concept_root / f"{safe}.md"
+        expected.add(path)
+        sources = Counter(item.account for item in items if item.account)
+        rows = [
+            "---",
+            'type: "concept-map"',
+            f"concept: {json.dumps(concept, ensure_ascii=False)}",
+            f"updated_at: {json.dumps(now_text(), ensure_ascii=False)}",
+            "---",
+            "",
+            f"# {concept}",
+            "",
+            f"> 自动形成的跨来源概念节点：{len(items)} 篇资料，"
+            f"{len(sources)} 个来源。这里只收录重点与参考内容。",
+            "",
+            "## 熔炼结论",
+            "",
+        ]
+        ranked_items = sorted(
+            items,
+            key=lambda value: (
+                -value.retrieval_weight,
+                -value.value_score,
+                -value.quality,
+                value.account,
+                value.title,
+            ),
+        )
+        synthesis_count = 0
+        for item in ranked_items:
+            if not item.value_summary and not item.highlights:
+                continue
+            insight = item.value_summary or item.highlights[0]
+            insight = re.sub(r"\s+", " ", insight).strip()
+            if len(insight) > 220:
+                insight = insight[:217].rstrip() + "…"
+            rows.append(
+                f"- **{item.knowledge_type}**：{insight} "
+                f"— {_wikilink(item.path, vault, item.title)}"
+            )
+            synthesis_count += 1
+            if synthesis_count >= 12:
+                break
+        if not synthesis_count:
+            rows.append("- 当前尚无经过 Codex 整理的可复用结论。")
+        rows += ["", "## 代表性证据来源", ""]
+        for item in ranked_items[:40]:
+            rows.append(
+                f"- {_wikilink(item.path, vault, item.title)}"
+                f" — {item.account or '未知来源'} · {item.knowledge_type}"
+                f" · {item.value_score or item.quality}/100"
+            )
+        if len(ranked_items) > 40:
+            rows += [
+                "",
+                f"> 为保持图谱轻量，仅连接 40 篇代表性证据；其余 {len(ranked_items) - 40} 篇保留在检索索引。",
+            ]
+        path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    for stale in concept_root.glob("*.md"):
+        if stale not in expected:
+            stale.unlink()
+    return len(grouped)
+
+
+def write_news_digest(notes: list[Note], vault: Path) -> Path:
+    path = vault / "20_Knowledge" / "资讯速览.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    quick_reads = [
+        note
+        for note in notes
+        if note.priority in {"速览", "回收建议"}
+    ]
+    rows = [
+        "# 资讯速览",
+        "",
+        f"> 更新时间：{now_text()} · {len(quick_reads)} 篇。这里不进入核心知识图谱。",
+        "",
+    ]
+    for note in sorted(quick_reads, key=lambda item: (-item.quality, item.title)):
+        rows.append(
+            f"- {_wikilink(note.path, vault, note.title)}"
+            f" — {note.knowledge_type} · {note.priority} · {note.quality}/100"
+        )
+    if not quick_reads:
+        rows.append("- 当前没有速览内容。")
+    path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    legacy = vault / "20_Knowledge" / "微信资讯速览.md"
+    legacy.write_text(
+        "# 微信资讯速览\n\n> 已并入跨来源的 [[20_Knowledge/资讯速览|资讯速览]]。\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def write_overview(
+    notes: list[Note],
+    links: dict[Path, list[tuple[Note, float, list[str]]]],
+    vault: Path,
+    archive_count: int,
+) -> Path:
+    path = vault / "20_Knowledge" / "个人知识星球.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    core_notes = [note for note in notes if note.corpus_tier in GRAPH_TIERS]
+    categories = Counter(note.category for note in core_notes)
+    accounts = Counter(note.account for note in core_notes if note.account)
+    rows = [
+        "# 个人知识星球",
+        "",
+        f"> 更新时间：{now_text()} · {len(core_notes)} 篇长期知识"
+        f"（另有 {len(notes) - len(core_notes)} 篇速览）"
+        f" · {archive_count} 篇可追溯原文进入本地证据索引",
+        "",
+        "## 可视化入口",
+        "",
+        "- [[20_Knowledge/作品集知识星系.canvas|作品集知识星系 Canvas]]：个人能力、代表作品与核心方法的固定星系图。",
+        "- [[20_Knowledge/NEX知识星系.canvas|NEX知识星系 Canvas]]：企业证据、RAG、内容产品、QA 与运营交付的项目星系图。",
+        "- [[20_Knowledge/清桥商业化知识星系.canvas|清桥商业化知识星系 Canvas]]：获客、Evidence 闸门、Agent、专家、产品阶梯、盈利模型与合规边界。",
+        "- Obsidian 左侧「关系图谱」：只显示个人语料、重点、参考、主题与概念；未整理原文和速览默认隐藏。",
+        "- 本地 Agent 检索顺序：个人语料 → 重点方法/观点 → 参考资料 → 速览 → 原文证据库。",
+        "- [[20_Knowledge/AI上下文/语料熔炼与停采标准|语料熔炼与停采标准]]：查看当前成熟度和何时停止继续深挖。",
+        "",
+        "## 主题入口",
+        "",
+    ]
+    for category, count in categories.most_common():
+        rows.append(f"- [[20_Knowledge/知识主题/{category}|{category}]]（{count}）")
+    concept_counts = Counter(
+        concept for note in core_notes for concept in note.concepts
+    )
+    rows += ["", "## 核心概念入口", ""]
+    for concept, count in concept_counts.most_common():
+        rows.append(f"- [[20_Knowledge/核心概念/{concept}|{concept}]]（{count}）")
+    rows += ["", "## 高频来源", ""]
+    for account, count in accounts.most_common(12):
+        rows.append(f"- {account}：{count} 篇")
+    rows += ["", "## 关联最丰富的文章", ""]
+    for note in sorted(core_notes, key=lambda item: len(links.get(item.path, [])), reverse=True)[:12]:
+        rows.append(
+            f"- {_wikilink(note.path, vault, note.title)}"
+            f"（{len(links.get(note.path, []))} 条关联）"
+        )
+    path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    legacy = vault / "20_Knowledge" / "微信知识图谱.md"
+    legacy.write_text(
+        "# 微信知识图谱\n\n> 已升级为跨来源的 [[20_Knowledge/个人知识星球|个人知识星球]]。\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def write_ai_profile(notes: list[Note], vault: Path, preference_summary: dict[str, Any]) -> Path:
+    """Compatibility wrapper for the bounded, identity-safe context writer."""
+
+    _context_path, markdown_path = personal_context.write_context(
+        notes,
+        vault,
+        preference_summary,
+    )
+    return markdown_path
+
+
+def _note_year(note: Note) -> str:
+    match = re.search(r"\b(20\d{2})\b", note.publish_date or note.path.name)
+    return match.group(1) if match else ""
+
+
+def _token_set(text: str) -> set[str]:
+    return set(tokenize(text).keys())
+
+
+def _jaccard(left: set[str], right: set[str]) -> float:
+    if not left or not right:
+        return 0.0
+    return len(left & right) / len(left | right)
+
+
+def write_maturity_report(
+    notes: list[Note],
+    raw_paths: list[Path],
+    links: dict[Path, list[tuple[Note, float, list[str]]]],
+    vault: Path,
+) -> tuple[Path, dict[str, Any]]:
+    deep_notes = [
+        note
+        for note in notes
+        if note.platform != "local"
+        and note.curation_status == "complete"
+        and note.corpus_tier in GRAPH_TIERS | {"brief"}
+    ]
+    deep_notes.sort(
+        key=lambda note: (
+            note.curated_at or "",
+            note.path.stat().st_mtime_ns if note.path.exists() else 0,
+            note.title,
+        )
+    )
+    window_notes = deep_notes[-MATURITY_WINDOW:]
+    previous_notes = deep_notes[:-MATURITY_WINDOW]
+    previous_concepts = {
+        concept for note in previous_notes for concept in note.concepts
+    }
+    window_concepts = {
+        concept for note in window_notes for concept in note.concepts
+    }
+    new_concepts = window_concepts - previous_concepts
+    new_concept_rate = (
+        len(new_concepts) / max(len(window_concepts), 1)
+        if window_notes
+        else 1.0
+    )
+    high_value_rate = (
+        sum(note.corpus_tier == "core" for note in window_notes)
+        / max(len(window_notes), 1)
+    )
+
+    previous_vectors = [
+        _token_set(note.value_summary or " ".join(note.highlights) or note.title)
+        for note in previous_notes[-500:]
+    ]
+    seen_concepts = set(previous_concepts)
+    redundant = 0
+    for note in window_notes:
+        vector = _token_set(
+            note.value_summary or " ".join(note.highlights) or note.title
+        )
+        lexical_similarity = max(
+            (_jaccard(vector, candidate) for candidate in previous_vectors),
+            default=0.0,
+        )
+        note_concepts = set(note.concepts)
+        concept_repetition = (
+            len(note_concepts & seen_concepts) / len(note_concepts)
+            if note_concepts
+            else 0.0
+        )
+        # Broad concepts such as “AI 治理” repeat very early and cannot by
+        # themselves prove that a new article is redundant. Require lexical
+        # overlap as a second signal, while still allowing near-duplicate
+        # summaries to qualify directly.
+        if lexical_similarity >= 0.15 or (
+            concept_repetition >= 0.80 and lexical_similarity >= 0.08
+        ):
+            redundant += 1
+        previous_vectors.append(vector)
+        seen_concepts.update(note_concepts)
+    redundancy_rate = redundant / max(len(window_notes), 1)
+
+    concept_counts = Counter(
+        concept for note in deep_notes for concept in note.concepts
+    )
+    concept_coverage = (
+        sum(count >= 3 for count in concept_counts.values())
+        / max(len(CONCEPT_RULES), 1)
+    )
+    archive_years = {
+        match.group(1)
+        for path in raw_paths
+        if _raw_note_has_usable_body(path)
+        if (match := re.search(r"\b(20\d{2})\b", path.name))
+    }
+    curated_year_counts = Counter(
+        year for note in deep_notes if (year := _note_year(note))
+    )
+    covered_years = {
+        year
+        for year in archive_years
+        if curated_year_counts.get(year, 0) >= 5
+    }
+    year_coverage = len(covered_years) / max(len(archive_years), 1)
+
+    stop_checks = {
+        "deep_curated_count": len(deep_notes) >= MIN_DEEP_CURATED_FOR_STOP,
+        "concept_coverage": concept_coverage >= MIN_CONCEPT_COVERAGE_FOR_STOP,
+        "year_coverage": year_coverage >= MIN_YEAR_COVERAGE_FOR_STOP,
+        "new_concept_rate": new_concept_rate <= MAX_NEW_CONCEPT_RATE_FOR_STOP,
+        "high_value_rate": high_value_rate <= MAX_HIGH_VALUE_RATE_FOR_STOP,
+        "redundancy_rate": redundancy_rate >= MIN_REDUNDANCY_RATE_FOR_STOP,
+    }
+    coverage_ready = (
+        stop_checks["concept_coverage"] and stop_checks["year_coverage"]
+    )
+    diminishing_returns = (
+        stop_checks["deep_curated_count"]
+        and stop_checks["new_concept_rate"]
+        and stop_checks["high_value_rate"]
+        and stop_checks["redundancy_rate"]
+    )
+    budget_cap_reached = (
+        len(deep_notes) >= MAX_DEEP_CURATED_BEFORE_STOP
+        and new_concept_rate <= MAX_NEW_CONCEPT_RATE_AT_BUDGET_CAP
+    )
+    representative_sample_ready = (
+        REFERENCE_LIBRARY_MODE
+        and len(deep_notes) >= MIN_DEEP_CURATED_FOR_STOP
+        and coverage_ready
+    )
+    stop_recommended = coverage_ready and (
+        diminishing_returns
+        or budget_cap_reached
+        or representative_sample_ready
+    )
+    if stop_recommended:
+        stage = "saturated"
+        next_action = (
+            "停止连续深挖历史文章；保留全量原文索引，只做增量更新和按问题回溯。"
+        )
+    elif len(deep_notes) < 100:
+        stage = "accumulating"
+        next_action = "继续积累高价值样本，优先方法、案例和用户长期主题。"
+    elif len(deep_notes) < MIN_DEEP_CURATED_FOR_STOP:
+        stage = "structuring"
+        next_action = "继续分层整理，并补齐欠覆盖年份与主题。"
+    else:
+        stage = "coverage_gap"
+        next_action = "数量已足够，停止追求篇数，优先补齐年份、概念与证据缺口。"
+
+    tier_counts = Counter(note.corpus_tier for note in notes)
+    report = {
+        "generated_at": now_text(),
+        "stage": stage,
+        "stop_recommended": stop_recommended,
+        "next_action": next_action,
+        "policy": {
+            "mode": (
+                "enterprise_evidence_library"
+                if REFERENCE_LIBRARY_MODE
+                else "full_semantic_curation"
+            ),
+            "raw_articles_are_user_opinions": False,
+            "historical_bulk_read_limit": MIN_DEEP_CURATED_FOR_STOP,
+        },
+        "corpus": {
+            "personal": tier_counts.get("personal", 0),
+            "core": tier_counts.get("core", 0),
+            "reference": tier_counts.get("reference", 0),
+            "brief": tier_counts.get("brief", 0),
+            "evidence_archive": len(raw_paths),
+            "deep_curated": len(deep_notes),
+        },
+        "metrics": {
+            "window_size": len(window_notes),
+            "concept_coverage": round(concept_coverage, 4),
+            "year_coverage": round(year_coverage, 4),
+            "new_concept_rate": round(new_concept_rate, 4),
+            "high_value_rate": round(high_value_rate, 4),
+            "redundancy_rate": round(redundancy_rate, 4),
+            "relation_density": round(
+                sum(len(links.get(note.path, [])) for note in notes)
+                / max(len(notes), 1),
+                4,
+            ),
+        },
+        "thresholds": {
+            "minimum_deep_curated": MIN_DEEP_CURATED_FOR_STOP,
+            "maximum_deep_curated_before_stop": MAX_DEEP_CURATED_BEFORE_STOP,
+            "minimum_concept_coverage": MIN_CONCEPT_COVERAGE_FOR_STOP,
+            "minimum_year_coverage": MIN_YEAR_COVERAGE_FOR_STOP,
+            "maximum_new_concept_rate": MAX_NEW_CONCEPT_RATE_FOR_STOP,
+            "maximum_new_concept_rate_at_budget_cap": (
+                MAX_NEW_CONCEPT_RATE_AT_BUDGET_CAP
+            ),
+            "maximum_high_value_rate": MAX_HIGH_VALUE_RATE_FOR_STOP,
+            "minimum_redundancy_rate": MIN_REDUNDANCY_RATE_FOR_STOP,
+        },
+        "checks": {
+            **stop_checks,
+            "coverage_ready": coverage_ready,
+            "diminishing_returns": diminishing_returns,
+            "budget_cap_reached": budget_cap_reached,
+            "representative_sample_ready": representative_sample_ready,
+        },
+        "year_counts": dict(sorted(curated_year_counts.items())),
+    }
+    MATURITY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary = MATURITY_PATH.with_suffix(".json.tmp")
+    temporary.write_text(
+        json.dumps(report, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, MATURITY_PATH)
+
+    path = vault / "20_Knowledge" / "AI上下文" / "语料熔炼与停采标准.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    check_label = lambda value: "已达到" if value else "未达到"
+    rows = [
+        "# 语料熔炼与停采标准",
+        "",
+        f"> 自动更新于 {report['generated_at']}。目标不是囤积最多文章，而是让 AI 用更少上下文取得更可靠、更像你的回答。",
+        "",
+        "## 四层语料",
+        "",
+        f"- **个人语料**：{report['corpus']['personal']} 篇。用户自己的项目、日记、作品与明确反馈，检索权重最高。",
+        f"- **核心知识**：{report['corpus']['core']} 篇。经过整理的重点方法、观点和案例，进入可视化图谱。",
+        f"- **参考知识**：{report['corpus']['reference']} 篇。用于证据对照和补充解释，进入图谱但权重低于核心层。",
+        f"- **速览与原文证据**：{report['corpus']['brief']} 篇速览、{report['corpus']['evidence_archive']} 篇原文。默认不进入图谱，只有回答需要时才回溯。",
+        "- **机构边界**：腾讯研究院等外部文章属于来源证据，不等于用户观点；全量正文服务企业 Agent / RAG，个人知识层只吸收筛选后的框架、方法和案例。",
+        "",
+        "## 当前成熟度",
+        "",
+        f"- 阶段：**{stage}**",
+        f"- 建议：{next_action}",
+        f"- 已深度整理：{len(deep_notes)} 篇",
+        f"- 概念覆盖：{concept_coverage:.0%}（{check_label(stop_checks['concept_coverage'])}）",
+        f"- 年份覆盖：{year_coverage:.0%}（{check_label(stop_checks['year_coverage'])}）",
+        f"- 最近 {len(window_notes)} 篇新概念率：{new_concept_rate:.0%}（{check_label(stop_checks['new_concept_rate'])}）",
+        f"- 最近 {len(window_notes)} 篇重点率：{high_value_rate:.0%}（{check_label(stop_checks['high_value_rate'])}）",
+        f"- 最近 {len(window_notes)} 篇高重复率：{redundancy_rate:.0%}（{check_label(stop_checks['redundancy_rate'])}）",
+        "",
+        "## 何时停止",
+        "",
+        "- 普通公众号：每个约 30 篇高价值样本后停止历史扩张，只追新增或按问题补证据。",
+        f"- 腾讯研究院：全量原文留在机构证据库；外部代表样本深读达到 {MIN_DEEP_CURATED_FOR_STOP} 篇且概念/年份覆盖达标后，停止连续深挖。",
+        f"- Token 预算保险：达到 {MAX_DEEP_CURATED_BEFORE_STOP} 篇后，只要概念、年份覆盖达标且最近窗口新概念率不超过 {MAX_NEW_CONCEPT_RATE_AT_BUDGET_CAP:.0%}，即停止批量深读，改为按问题定向回溯。",
+        "- 停止不等于删除：未整理原文继续保留在本地证据索引中，AI在核心层回答不足时才检索它们。",
+        "- 如果个人项目、职业方向或长期兴趣发生变化，重新打开相应主题的定向深挖，而不是恢复全量扫描。",
+        "",
+        "## AI 调用顺序",
+        "",
+        "1. 先检索个人语料，确定你的目标、偏好和已有判断。",
+        "2. 再检索重点方法、观点和案例，组织答案骨架。",
+        "3. 用参考层做跨来源校验，并标明来源观点不等于你的观点。",
+        "4. 只有信息不足或需要原始证据时，回溯速览与全文原文库。",
+    ]
+    path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    return path, report
+
+
+def _raw_note_has_usable_body(path: Path) -> bool:
+    try:
+        if path.stat().st_size > 4096:
+            return True
+        text = path.read_text(encoding="utf-8", errors="replace").rstrip()
+    except OSError:
+        return False
+    return not (
+        text.endswith("未抓取到正文内容。")
+        or text.endswith("未抓取到正文内容.")
+        or text.endswith("正文内容暂不可用。")
+        or text.endswith("正文内容暂不可用.")
+    )
+
+
+def strip_raw_generated_links(paths: list[Path]) -> int:
+    changed = 0
+    for path in paths:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        if START_MARKER not in text:
+            continue
+        cleaned = re.sub(
+            rf"\n?{re.escape(START_MARKER)}.*?{re.escape(END_MARKER)}\n?",
+            "\n",
+            text,
+            flags=re.DOTALL,
+        ).rstrip() + "\n"
+        if cleaned != text:
+            path.write_text(cleaned, encoding="utf-8")
+            changed += 1
+    return changed
+
+
+def configure_obsidian_graph(vault: Path) -> Path:
+    path = vault / ".obsidian" / "graph.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        config = {}
+    config.update(
+        {
+            "search": OBSIDIAN_GRAPH_FILTER,
+            "showTags": False,
+            "showAttachments": False,
+            "hideUnresolved": True,
+            "showOrphans": False,
+        }
+    )
+    path.write_text(
+        json.dumps(config, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def write_sqlite_index(
+    notes: list[Note],
+    links: dict[Path, list[tuple[Note, float, list[str]]]],
+    evidence_notes: list[Note],
+    raw_wechat_paths: list[Path],
+) -> tuple[Path, int]:
+    INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(INDEX_PATH)
+    archive_count = 0
+    try:
+        connection.executescript(
+            """
+            DROP TABLE IF EXISTS articles;
+            DROP TABLE IF EXISTS links;
+            DROP TABLE IF EXISTS source_archive;
+            CREATE TABLE articles (
+                id INTEGER PRIMARY KEY,
+                path TEXT UNIQUE NOT NULL,
+                title TEXT NOT NULL,
+                source_url TEXT,
+                account TEXT,
+                category TEXT,
+                quality INTEGER,
+                knowledge_type TEXT,
+                priority TEXT,
+                curation_status TEXT,
+                mastery_status TEXT,
+                content_status TEXT,
+                corpus_namespace TEXT NOT NULL,
+                authorship TEXT NOT NULL,
+                confidentiality TEXT NOT NULL,
+                engagement_status TEXT NOT NULL,
+                stance TEXT NOT NULL,
+                persona_influence REAL NOT NULL,
+                identity_explicit INTEGER NOT NULL,
+                corpus_tier TEXT NOT NULL,
+                retrieval_weight REAL NOT NULL,
+                value_score INTEGER NOT NULL,
+                publish_date TEXT,
+                curated_at TEXT,
+                summary TEXT,
+                highlights TEXT,
+                concepts TEXT,
+                search_terms TEXT,
+                body TEXT
+            );
+            CREATE TABLE links (
+                source_path TEXT NOT NULL,
+                target_path TEXT NOT NULL,
+                score REAL NOT NULL,
+                relation_type TEXT NOT NULL,
+                evidence_strength TEXT NOT NULL,
+                reasons TEXT NOT NULL
+            );
+            CREATE TABLE source_archive (
+                id INTEGER PRIMARY KEY,
+                path TEXT UNIQUE NOT NULL,
+                title TEXT NOT NULL,
+                source_url TEXT,
+                account TEXT,
+                category TEXT,
+                quality INTEGER,
+                priority TEXT,
+                curation_status TEXT,
+                content_status TEXT,
+                corpus_namespace TEXT NOT NULL,
+                authorship TEXT NOT NULL,
+                confidentiality TEXT NOT NULL,
+                corpus_tier TEXT NOT NULL,
+                publish_date TEXT,
+                curated_at TEXT,
+                search_terms TEXT,
+                body TEXT
+            );
+            """
+        )
+        archived_urls: set[str] = set()
+        for note in notes:
+            archive_url = canonical_source_url(note.url)
+            if archive_url:
+                archived_urls.add(archive_url)
+            connection.execute(
+                "INSERT OR REPLACE INTO source_archive(path,title,source_url,account,category,quality,priority,curation_status,content_status,corpus_namespace,authorship,confidentiality,corpus_tier,publish_date,curated_at,search_terms,body) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    str(note.path),
+                    note.title,
+                    note.url,
+                    note.account,
+                    note.category,
+                    note.quality,
+                    note.priority,
+                    note.curation_status,
+                    note.content_status,
+                    note.corpus_namespace,
+                    note.authorship,
+                    note.confidentiality,
+                    note.corpus_tier,
+                    note.publish_date,
+                    note.curated_at,
+                    " ".join(note.tokens),
+                    note.body,
+                ),
+            )
+            archive_count += 1
+            if note.corpus_tier == "evidence":
+                continue
+            connection.execute(
+                "INSERT INTO articles(path,title,source_url,account,category,quality,knowledge_type,priority,curation_status,mastery_status,content_status,corpus_namespace,authorship,confidentiality,engagement_status,stance,persona_influence,identity_explicit,corpus_tier,retrieval_weight,value_score,publish_date,curated_at,summary,highlights,concepts,search_terms,body) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    str(note.path),
+                    note.title,
+                    note.url,
+                    note.account,
+                    note.category,
+                    note.quality,
+                    note.knowledge_type,
+                    note.priority,
+                    note.curation_status,
+                    note.mastery_status,
+                    note.content_status,
+                    note.corpus_namespace,
+                    note.authorship,
+                    note.confidentiality,
+                    note.engagement_status,
+                    note.stance,
+                    note.persona_influence,
+                    int(note.identity_explicit),
+                    note.corpus_tier,
+                    note.retrieval_weight,
+                    note.value_score or note.quality,
+                    note.publish_date,
+                    note.curated_at,
+                    note.value_summary,
+                    json.dumps(note.highlights, ensure_ascii=False),
+                    "；".join(note.concepts),
+                    " ".join(note.tokens),
+                    note.body,
+                ),
+            )
+            for target, score, reasons in links.get(note.path, []):
+                relation_kind = reasons[0] if reasons else "语义延伸"
+                evidence_strength = (
+                    "强"
+                    if score >= 0.75 or relation_kind == "显式引用"
+                    else "中"
+                    if score >= 0.35
+                    else "弱"
+                )
+                connection.execute(
+                    "INSERT INTO links(source_path,target_path,score,relation_type,evidence_strength,reasons) VALUES(?,?,?,?,?,?)",
+                    (
+                        str(note.path),
+                        str(target.path),
+                        score,
+                        relation_kind,
+                        evidence_strength,
+                        "；".join(reasons),
+                    ),
+                )
+        for note in evidence_notes:
+            archive_url = canonical_source_url(note.url)
+            if archive_url and archive_url in archived_urls:
+                continue
+            if archive_url:
+                archived_urls.add(archive_url)
+            connection.execute(
+                "INSERT OR REPLACE INTO source_archive(path,title,source_url,account,category,quality,priority,curation_status,content_status,corpus_namespace,authorship,confidentiality,corpus_tier,publish_date,curated_at,search_terms,body) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    str(note.path),
+                    note.title,
+                    note.url,
+                    note.account,
+                    note.category,
+                    note.quality,
+                    note.priority,
+                    note.curation_status,
+                    note.content_status,
+                    note.corpus_namespace,
+                    note.authorship,
+                    note.confidentiality,
+                    "evidence",
+                    note.publish_date,
+                    note.curated_at,
+                    " ".join(note.tokens),
+                    note.body,
+                ),
+            )
+            archive_count += 1
+        # Stream raw subscription notes into the evidence archive one file at
+        # a time. They remain searchable without entering the core graph or
+        # being held in memory as a second full corpus.
+        for path in raw_wechat_paths:
+            text = path.read_text(encoding="utf-8", errors="replace")
+            source_url = str(_field(text, "source_url") or _field(text, "sourceUrl"))
+            canonical = canonical_source_url(source_url)
+            if canonical and canonical in archived_urls:
+                continue
             if canonical:
                 archived_urls.add(canonical)
             body = _without_generated_links(text)
@@ -505,7 +1440,7 @@ def related_notes(notes: list[Note]) -> dict[Path, list[tuple[Note, float, list[
             indexed_body = body if has_usable_body else ""
             search_terms = " ".join(document_tokens(title, indexed_body))
             connection.execute(
-                "INSERT OR REPLACE INTO source_archive(path,title,source_url,account,category,quality,priority,curation_status,content_status,corpus_namespace,authorship,confidentiality,corpus_tier,search_terms,body) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT OR REPLACE INTO source_archive(path,title,source_url,account,category,quality,priority,curation_status,content_status,corpus_namespace,authorship,confidentiality,corpus_tier,publish_date,curated_at,search_terms,body) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     str(path),
                     title,
@@ -520,6 +1455,11 @@ def related_notes(notes: list[Note]) -> dict[Path, list[tuple[Note, float, list[
                     "external",
                     "public_external",
                     "evidence",
+                    str(
+                        _field(text, "publish_date")
+                        or _field(text, "published_at")
+                    ),
+                    str(_field(text, "curated_at")),
                     search_terms,
                     indexed_body,
                 ),
@@ -634,6 +1574,54 @@ def _namespace_filter(
     return f" AND {prefix}corpus_namespace IN ({placeholders})", namespaces
 
 
+def _attach_citation(item: dict[str, Any]) -> None:
+    date = str(item.get("publish_date") or item.get("curated_at") or "")
+    date_kind = (
+        "published"
+        if item.get("publish_date")
+        else "curated"
+        if item.get("curated_at")
+        else "unknown"
+    )
+    item["temporal"] = {"date": date, "date_kind": date_kind}
+    item["citation"] = {
+        "title": str(item.get("title") or ""),
+        "source_url": str(item.get("source_url") or ""),
+        "date": date,
+        "date_kind": date_kind,
+        "local_note": str(item.get("path") or ""),
+    }
+
+
+def _date_select(
+    connection: sqlite3.Connection,
+    table: str,
+    alias: str = "",
+) -> str:
+    columns = {
+        str(row[1])
+        for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    if {"publish_date", "curated_at"} <= columns:
+        prefix = f"{alias}." if alias else ""
+        return f"{prefix}publish_date,{prefix}curated_at"
+    return "'' AS publish_date,'' AS curated_at"
+
+
+def _identity_explicit_select(
+    connection: sqlite3.Connection,
+    alias: str = "",
+) -> str:
+    columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(articles)").fetchall()
+    }
+    if "identity_explicit" in columns:
+        prefix = f"{alias}." if alias else ""
+        return f"{prefix}identity_explicit"
+    return "0 AS identity_explicit"
+
+
 def _search_core(
     connection: sqlite3.Connection,
     terms: list[str],
@@ -646,6 +1634,10 @@ def _search_core(
         '"' + term.replace('"', '""') + '"' for term in terms
     )
     namespace_clause, namespace_params = _namespace_filter(namespaces, "a")
+    joined_dates = _date_select(connection, "articles", "a")
+    plain_dates = _date_select(connection, "articles")
+    joined_identity_explicit = _identity_explicit_select(connection, "a")
+    plain_identity_explicit = _identity_explicit_select(connection)
     rows: list[sqlite3.Row] = []
     try:
         rows = connection.execute(
@@ -653,8 +1645,8 @@ def _search_core(
             SELECT a.title,a.path,a.source_url,a.account,a.category,a.quality,a.concepts,
                    a.priority,a.corpus_namespace,a.authorship,a.confidentiality,
                    a.engagement_status,a.stance,a.persona_influence,
-                   a.corpus_tier,a.retrieval_weight,a.value_score,
-                   a.summary,a.highlights,
+                   {joined_identity_explicit},a.corpus_tier,a.retrieval_weight,a.value_score,
+                   {joined_dates},a.summary,a.highlights,
                    substr(a.body,1,240) AS snippet,
                    a.body AS _rank_body,
                    bm25(articles_fts, 8.0, 4.0, 3.0, 6.0, 4.0, 2.0, 1.0)
@@ -692,7 +1684,9 @@ def _search_core(
             f"""
             SELECT title,path,source_url,account,category,quality,concepts,priority,
                    corpus_namespace,authorship,confidentiality,engagement_status,
-                   stance,persona_influence,corpus_tier,retrieval_weight,value_score,summary,highlights,
+                   stance,persona_influence,{plain_identity_explicit},
+                   corpus_tier,retrieval_weight,value_score,
+                   {plain_dates},summary,highlights,
                    substr(body,1,240) AS snippet,
                    ({score_clause}) AS matched_terms
             FROM articles
@@ -754,7 +1748,8 @@ def _search_core(
             "engagement_status": item.get("engagement_status"),
             "stance": item.get("stance"),
             "represents_user": item.get("corpus_namespace")
-            == knowledge_schema.PERSONAL_MEMORY,
+            == knowledge_schema.PERSONAL_MEMORY
+            and bool(item.get("identity_explicit")),
         }
         item["retrieval_reason"] = {
             knowledge_schema.PERSONAL_MEMORY: "个人第二大脑",
@@ -762,6 +1757,7 @@ def _search_core(
             knowledge_schema.ENTERPRISE_INTERNAL: "企业内部资料",
             knowledge_schema.AUTHORITATIVE_EXTERNAL: "权威外部资料",
         }.get(str(item.get("corpus_namespace")), "知识索引")
+        _attach_citation(item)
     return results
 
 
@@ -777,13 +1773,15 @@ def _search_archive(
         '"' + term.replace('"', '""') + '"' for term in terms
     )
     namespace_clause, namespace_params = _namespace_filter(namespaces, "a")
+    joined_dates = _date_select(connection, "source_archive", "a")
+    plain_dates = _date_select(connection, "source_archive")
     rows: list[sqlite3.Row] = []
     try:
         rows = connection.execute(
             f"""
             SELECT a.title,a.path,a.source_url,a.account,a.category,a.quality,
                    a.priority,a.content_status,a.corpus_namespace,a.authorship,
-                   a.confidentiality,a.corpus_tier,
+                   a.confidentiality,a.corpus_tier,{joined_dates},
                    substr(a.body,1,240) AS snippet
             FROM source_archive_fts
             JOIN source_archive a ON a.path = source_archive_fts.path
@@ -815,6 +1813,7 @@ def _search_archive(
             f"""
             SELECT title,path,source_url,account,category,quality,priority,
                    content_status,corpus_namespace,authorship,confidentiality,corpus_tier,
+                   {plain_dates},
                    substr(body,1,240) AS snippet,
                    ({score_clause}) AS matched_terms
             FROM source_archive
@@ -842,6 +1841,7 @@ def _search_archive(
             "represents_user": False,
         }
         item["retrieval_reason"] = "原文证据回溯"
+        _attach_citation(item)
     return results
 
 
@@ -916,6 +1916,167 @@ def search(
         connection.close()
 
 
+def _recall_intent(query: str) -> str:
+    value = query.casefold()
+    enterprise_cues = (
+        "nex",
+        "企业",
+        "公司",
+        "内部",
+        "项目事实",
+        "制度",
+        "流程",
+    )
+    research_cues = (
+        "研究显示",
+        "行业",
+        "论文",
+        "报告",
+        "外部证据",
+        "腾讯研究院",
+        "资料怎么说",
+    )
+    personal_cues = (
+        "我过去",
+        "我以前",
+        "我之前",
+        "我当时",
+        "我的想法",
+        "我的判断",
+        "我怎么想",
+        "我为什么",
+        "什么时候想到",
+        "曾经",
+    )
+    if any(cue in value for cue in personal_cues):
+        return "personal_recall"
+    if any(cue in value for cue in enterprise_cues):
+        return "enterprise_lookup"
+    if any(cue in value for cue in research_cues):
+        return "research_lookup"
+    return "personal_recall"
+
+
+def _recall_terms(query: str) -> str:
+    value = query
+    for cue in (
+        "我过去",
+        "我以前",
+        "我之前",
+        "我当时",
+        "我的想法",
+        "我的判断",
+        "我怎么想",
+        "我为什么",
+        "什么时候想到",
+        "曾经",
+        "资料怎么说",
+    ):
+        value = value.replace(cue, " ")
+    return re.sub(r"\s+", " ", value).strip() or query
+
+
+def recall(
+    query: str,
+    limit: int = 8,
+    include_evidence: bool = False,
+) -> dict[str, Any]:
+    """Route a memory question without letting external text impersonate the user."""
+
+    query = query.strip()
+    bounded_limit = max(1, min(int(limit or 8), 20))
+    intent = _recall_intent(query)
+    retrieval_query = _recall_terms(query)
+    memories: list[dict[str, Any]] = []
+    enterprise_facts: list[dict[str, Any]] = []
+    evidence: list[dict[str, Any]] = []
+    route: list[str] = []
+
+    if intent == "personal_recall":
+        route.append(knowledge_schema.PERSONAL_MEMORY)
+        memories = [
+            item
+            for item in search(
+                retrieval_query,
+                limit=max(bounded_limit * 2, 10),
+                scope="personal",
+            )
+            if item.get("identity", {}).get("represents_user")
+        ][:bounded_limit]
+        if include_evidence:
+            route.extend(
+                (
+                    knowledge_schema.PROFESSIONAL_REFERENCE,
+                    knowledge_schema.AUTHORITATIVE_EXTERNAL,
+                )
+            )
+            evidence = search(
+                retrieval_query,
+                limit=max(1, bounded_limit // 2),
+                scope="professional",
+            )
+    elif intent == "enterprise_lookup":
+        route.append(knowledge_schema.ENTERPRISE_INTERNAL)
+        enterprise_facts = search(
+            retrieval_query,
+            limit=bounded_limit,
+            scope="enterprise",
+        )
+        if include_evidence:
+            route.extend(
+                (
+                    knowledge_schema.PROFESSIONAL_REFERENCE,
+                    knowledge_schema.AUTHORITATIVE_EXTERNAL,
+                )
+            )
+            evidence = search(
+                retrieval_query,
+                limit=max(1, bounded_limit // 2),
+                scope="professional",
+            )
+    else:
+        route.extend(
+            (
+                knowledge_schema.PROFESSIONAL_REFERENCE,
+                knowledge_schema.AUTHORITATIVE_EXTERNAL,
+            )
+        )
+        evidence = search(
+            retrieval_query,
+            limit=bounded_limit,
+            scope="professional",
+        )
+
+    found_personal = bool(memories)
+    boundary = (
+        "Personal memories are user-authored records. External evidence is returned "
+        "in a separate field and never represents the user's view."
+    )
+    if intent == "personal_recall" and not found_personal:
+        boundary = (
+            "No matching user-authored memory was found. The system will not replace "
+            "a missing personal memory with an external article."
+        )
+    return {
+        "query": query,
+        "retrieval_query": retrieval_query,
+        "intent": intent,
+        "route": route,
+        "memories": memories,
+        "enterprise_facts": enterprise_facts,
+        "evidence": evidence,
+        "boundary": boundary,
+        "context_budget": {
+            "max_primary_results": bounded_limit,
+            "max_evidence_results": (
+                max(1, bounded_limit // 2) if include_evidence else 0
+            ),
+            "full_articles_loaded": 0,
+            "archive_fallback": False,
+        },
+    }
+
+
 def build(vault: Path = DEFAULT_VAULT, preference_summary: dict[str, Any] | None = None) -> dict[str, Any]:
     article_roots = [
         vault / "10_Sources" / "WeChat" / "Articles",
@@ -938,7 +2099,11 @@ def build(vault: Path = DEFAULT_VAULT, preference_summary: dict[str, Any] | None
     topic_count = write_topic_maps(notes, vault)
     concept_count = write_concept_maps(notes, vault)
     digest = write_news_digest(notes, vault)
-    profile = write_ai_profile(notes, vault, preference_summary or {})
+    context_json, profile = personal_context.write_context(
+        notes,
+        vault,
+        preference_summary or {},
+    )
     raw_paths = raw_wechat_notes(vault)
     stripped_raw_link_count = strip_raw_generated_links(raw_paths)
     graph_config = configure_obsidian_graph(vault)
@@ -963,6 +2128,7 @@ def build(vault: Path = DEFAULT_VAULT, preference_summary: dict[str, Any] | None
         "overview_path": str(overview),
         "digest_path": str(digest),
         "profile_path": str(profile),
+        "context_json_path": str(context_json),
         "index_path": str(index),
         "archive_count": archive_count,
         "maturity_path": str(maturity_path),

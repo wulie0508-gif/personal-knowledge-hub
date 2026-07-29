@@ -4,9 +4,12 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+import app
 import knowledge_graph
 import knowledge_schema
+import personal_context
 import runtime_config
 
 
@@ -19,6 +22,11 @@ def write_note(path: Path, frontmatter: str, body: str) -> None:
 
 
 class RuntimeArchitectureTests(unittest.TestCase):
+    def test_http_service_rejects_non_loopback_bindings(self) -> None:
+        self.assertEqual(app.validate_local_host("127.0.0.1"), "127.0.0.1")
+        with self.assertRaises(ValueError):
+            app.validate_local_host("0.0.0.0")
+
     def test_external_content_cannot_influence_persona(self) -> None:
         result = knowledge_schema.identity_metadata(
             namespace=knowledge_schema.PROFESSIONAL_REFERENCE,
@@ -80,7 +88,24 @@ knowledge_value_score: 88
                     """,
                     "外部研究提出机器人产品应验证维护成本、使用频率和用户价值。",
                 )
-                knowledge_graph.build(vault)
+                with (
+                    mock.patch.object(
+                        personal_context,
+                        "CONTEXT_PATH",
+                        root / "context" / "ai-context.json",
+                    ),
+                    mock.patch.object(
+                        personal_context,
+                        "WATCHER_STATE_PATH",
+                        root / "wechat-history-state.json",
+                    ),
+                    mock.patch.object(
+                        personal_context,
+                        "PREFERENCE_PATH",
+                        root / "quality-preferences.json",
+                    ),
+                ):
+                    knowledge_graph.build(vault)
                 personal = knowledge_graph.search("机器人 产品", scope="personal")
                 professional = knowledge_graph.search("机器人 产品", scope="professional")
                 self.assertEqual(personal[0]["identity"]["namespace"], "personal_memory")

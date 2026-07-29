@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -13,7 +14,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,18 @@ DEFAULT_API = "http://127.0.0.1:8765/api/submit"
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def chromium_time_iso(value: int) -> str:
+    """Convert Chromium microseconds since 1601 to a local ISO timestamp."""
+
+    try:
+        instant = datetime(1601, 1, 1, tzinfo=timezone.utc) + timedelta(
+            microseconds=int(value)
+        )
+        return instant.astimezone().isoformat(timespec="seconds")
+    except (OverflowError, TypeError, ValueError):
+        return ""
 
 
 def load_json(path: Path, default: Any) -> Any:
@@ -152,13 +165,19 @@ def existing_job_urls() -> set[str]:
     return result
 
 
-def submit(url: str, api_url: str, title: str = "") -> None:
+def submit(
+    url: str,
+    api_url: str,
+    title: str = "",
+    observed_at: str = "",
+) -> None:
     payload = json.dumps(
         {
             "text": url,
             "route": "router",
             "source": "wechat_history",
             "title": title,
+            "observed_at": observed_at,
         }
     ).encode("utf-8")
     request = urllib.request.Request(
@@ -183,7 +202,40 @@ def default_state() -> dict[str, Any]:
         "detected_count": 0,
         "submitted_count": 0,
         "pending": [],
+        "recent_observations": [],
     }
+
+
+def remember_observations(
+    state: dict[str, Any],
+    records: list[dict[str, Any]],
+    limit: int = 120,
+) -> None:
+    """Keep a bounded private trace without storing raw URLs in AI context."""
+
+    current = [
+        item
+        for item in state.get("recent_observations") or []
+        if isinstance(item, dict) and item.get("url_hash")
+    ]
+    by_hash = {str(item["url_hash"]): item for item in current}
+    for record in records:
+        url_hash = hashlib.sha256(
+            str(record.get("url") or "").encode("utf-8")
+        ).hexdigest()
+        by_hash[url_hash] = {
+            "url_hash": url_hash,
+            "title": str(record.get("title") or "").strip()[:240],
+            "observed_at": chromium_time_iso(
+                int(record.get("last_visit_time") or 0)
+            ),
+            "source": "wechat_history",
+        }
+    state["recent_observations"] = sorted(
+        by_hash.values(),
+        key=lambda item: str(item.get("observed_at") or ""),
+        reverse=True,
+    )[: max(1, limit)]
 
 
 def scan_once(state: dict[str, Any], api_url: str) -> dict[str, Any]:
@@ -205,6 +257,7 @@ def scan_once(state: dict[str, Any], api_url: str) -> dict[str, Any]:
     after = int(state.get("last_visit_time") or 0)
     records = read_history(history, after)
     if records:
+        remember_observations(state, records)
         state["last_visit_time"] = max(
             int(item["last_visit_time"]) for item in records
         )
@@ -223,7 +276,12 @@ def scan_once(state: dict[str, Any], api_url: str) -> dict[str, Any]:
     still_pending: list[dict[str, Any]] = []
     for record in pending_by_url.values():
         try:
-            submit(record["url"], api_url, str(record.get("title") or ""))
+            submit(
+                record["url"],
+                api_url,
+                str(record.get("title") or ""),
+                chromium_time_iso(int(record.get("last_visit_time") or 0)),
+            )
             known.add(record["url"])
             state["submitted_count"] = int(state.get("submitted_count") or 0) + 1
         except (urllib.error.URLError, TimeoutError, RuntimeError, OSError) as exc:

@@ -581,7 +581,157 @@ def assess_quality(
         flags.append("信息量较低")
     score = max(0, min(100, score))
     tier = "高" if score >= 75 else "中" if score >= 50 else "低"
-   …1512 tokens truncated…_text(
+    return score, tier, flags
+
+
+def frontmatter_value(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
+def build_note(
+    result: ArticleResult,
+    published: str,
+    text: str,
+    images: list[ImageResult],
+) -> str:
+    lines = [
+        "---",
+        f"title: {frontmatter_value(result.title)}",
+        f"sourceUrl: {frontmatter_value(result.source_url)}",
+        'platform: "wechat_mp"',
+        f"corpus_namespace: {frontmatter_value(knowledge_schema.PROFESSIONAL_REFERENCE)}",
+        'authorship: "external"',
+        'confidentiality: "public_external"',
+        'engagement_status: "unread"',
+        'stance: "unreviewed"',
+        "persona_influence: 0.0",
+        f"account: {frontmatter_value(result.account)}",
+        f"category: {frontmatter_value(result.category)}",
+        f"quality_score: {result.quality_score}",
+        f"quality_tier: {frontmatter_value(result.quality_tier)}",
+        f"quality_flags: {frontmatter_value(result.quality_flags)}",
+        f"knowledge_type: {frontmatter_value(result.knowledge_type)}",
+        f"knowledge_value_score: {result.knowledge_value_score}",
+        f"knowledge_priority: {frontmatter_value(result.knowledge_priority)}",
+        f"value_reasons: {frontmatter_value(result.value_reasons)}",
+        f"mastery_status: {frontmatter_value(result.mastery_status)}",
+        f"preference_adjustment: {result.preference_adjustment}",
+        f"preference_reasons: {frontmatter_value(result.preference_reasons)}",
+        f"auto_remove_recommended: {str(result.auto_remove_recommended).lower()}",
+        f"content_status: {frontmatter_value(result.content_status)}",
+        f"recovery_source: {frontmatter_value(result.recovery_source)}",
+        f"text_length: {result.text_length}",
+        f"ocr_length: {result.ocr_length}",
+        f"ocr_status: {frontmatter_value(result.ocr_status)}",
+        f"image_count: {result.image_count}",
+        f"kept_image_count: {result.kept_image_count}",
+        f"imported_at: {frontmatter_value(now_text())}",
+    ]
+    if published:
+        lines.append(f"published_at: {frontmatter_value(published)}")
+    lines += [
+        "---",
+        "",
+        f"# {result.title}",
+        "",
+        f"- 公众号：{result.account or '未知'}",
+        f"- 分类：{result.category}",
+        f"- 质量：{result.quality_tier}（{result.quality_score}/100）",
+        f"- 知识价值：{result.knowledge_type} · {result.knowledge_priority}（{result.knowledge_value_score}/100）",
+        f"- 原文：{result.source_url}",
+        "",
+    ]
+    if (
+        result.knowledge_priority == "重点"
+        or result.value_summary
+        or result.key_insights
+    ):
+        lines += ["<!-- knowledge-value:start -->"]
+    if result.knowledge_priority == "重点":
+        lines += [
+            "> [!important] 重点知识",
+            "> 这篇包含可复用的见解、方法或案例，优先进入你的长期知识网络。",
+            "",
+        ]
+    if result.value_summary or result.key_insights:
+        lines += ["## 知识提炼", ""]
+        if result.value_summary:
+            lines += [result.value_summary, ""]
+        if result.key_insights:
+            lines += ["### 关键点", ""]
+            lines += [f"- {item}" for item in result.key_insights]
+            lines.append("")
+    if (
+        result.knowledge_priority == "重点"
+        or result.value_summary
+        or result.key_insights
+    ):
+        lines += ["<!-- knowledge-value:end -->", ""]
+    lines += [
+        "## 正文",
+        "",
+        text.strip() or "> 正文未能取得，已保留标题与原文链接，等待后续补抓。",
+        "",
+    ]
+    kept = [item for item in images if item.kept]
+    ocr_items = [item for item in images if item.ocr_text.strip()]
+    if kept:
+        lines += ["## 精简图片", ""]
+        for index, item in enumerate(kept, 1):
+            lines += [
+                f"### 图 {index}",
+                "",
+                f"![]({urllib.parse.quote(item.local_path, safe='/._-')})",
+                "",
+            ]
+    if ocr_items:
+        lines += ["## 图片 OCR", ""]
+        for index, item in enumerate(ocr_items, 1):
+            lines += [f"### OCR {index}", "", item.ocr_text.strip(), ""]
+    if result.quality_flags:
+        lines += ["## 质量提示", "", "- " + "\n- ".join(result.quality_flags), ""]
+    return "\n".join(lines).strip() + "\n"
+
+
+def output_folder(result: ArticleResult) -> Path:
+    if result.knowledge_priority == "重点":
+        return ARTICLE_ROOT / "重点知识" / safe_name(result.category, 30)
+    if result.knowledge_priority == "速览":
+        return ARTICLE_ROOT / "资讯速览"
+    if result.knowledge_priority == "回收建议":
+        return ARTICLE_ROOT / "低价值待清理"
+    return ARTICLE_ROOT / safe_name(result.category, 30)
+
+
+def import_one(
+    url: str,
+    title_hint: str = "",
+    run_ocr: bool = True,
+) -> ArticleResult:
+    result = ArticleResult(source_url=url, title=title_hint or "微信公众号文章")
+    try:
+        html_text, final_url = fetch_html(url)
+        result.source_url = history_source.canonical_article_url(final_url) or url
+        existing_notes = list(
+            ARTICLE_ROOT.rglob(f"*--{article_id(result.source_url)}.md")
+        )
+        existing_text = (
+            existing_notes[0].read_text(encoding="utf-8", errors="replace")
+            if existing_notes
+            else ""
+        )
+        doc = html.fromstring(html_text)
+        title, account, published = extract_metadata(doc, title_hint)
+        if account in {"", "微信公众平台"}:
+            account = frontmatter_field(existing_text, "account") or account
+        if not published:
+            published = frontmatter_field(existing_text, "published_at")
+        result.title = title
+        result.account = account
+        root = content_root(doc)
+        text, text_length = extract_plain_text(root)
+        if not text_length:
+            text, text_length, embedded_source = extract_embedded_text(
                 doc,
                 html_text,
             )

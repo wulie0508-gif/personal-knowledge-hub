@@ -12,6 +12,7 @@ from typing import Any
 import app
 import knowledge_graph
 import local_importer
+import personal_context
 
 
 def emit(value: Any) -> None:
@@ -31,6 +32,24 @@ def command_search(query: str, limit: int, scope: str) -> None:
                 scope=scope,
             ),
         }
+    )
+
+
+def command_context(max_chars: int) -> None:
+    emit(personal_context.get_agent_context(max_chars=max_chars))
+
+
+def command_recall(
+    query: str,
+    limit: int,
+    include_evidence: bool,
+) -> None:
+    emit(
+        knowledge_graph.recall(
+            query,
+            limit=limit,
+            include_evidence=include_evidence,
+        )
     )
 
 
@@ -70,9 +89,39 @@ def main() -> int:
     search_parser.add_argument("--limit", type=int, default=10)
     search_parser.add_argument(
         "--scope",
-        choices=("all", "knowledge", "archive"),
+        choices=(
+            "all",
+            "knowledge",
+            "archive",
+            "personal",
+            "professional",
+            "enterprise",
+            "authoritative",
+        ),
         default="all",
         help="all=知识优先并在不足时回溯原文；archive=直接搜索全部来源库",
+    )
+
+    context_parser = subparsers.add_parser(
+        "context",
+        help="Return the compact, local-only AI personal context packet",
+    )
+    context_parser.add_argument(
+        "--max-chars",
+        type=int,
+        default=personal_context.DEFAULT_MAX_CHARS,
+    )
+
+    recall_parser = subparsers.add_parser(
+        "recall",
+        help="Recall user-authored memory first, with optional external evidence",
+    )
+    recall_parser.add_argument("query")
+    recall_parser.add_argument("--limit", type=int, default=8)
+    recall_parser.add_argument(
+        "--include-evidence",
+        action="store_true",
+        help="Retrieve separately-labelled external evidence after personal memory",
     )
 
     import_parser = subparsers.add_parser("import", help="导入本地文件或文件夹")
@@ -84,6 +133,14 @@ def main() -> int:
     args = parser.parse_args()
     if args.command == "search":
         command_search(args.query, args.limit, args.scope)
+    elif args.command == "context":
+        command_context(args.max_chars)
+    elif args.command == "recall":
+        command_recall(
+            args.query,
+            args.limit,
+            args.include_evidence,
+        )
     elif args.command == "import":
         command_import(args.path)
     elif args.command == "rebuild":

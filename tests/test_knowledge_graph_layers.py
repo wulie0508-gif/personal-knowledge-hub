@@ -4,9 +4,11 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import codex_curation_queue
 import knowledge_graph
+import personal_context
 
 
 def write_note(path: Path, frontmatter: str, body: str) -> None:
@@ -70,7 +72,24 @@ curated_at: 2026-07-26T11:00:00+08:00
                     "海外投资应识别东道国审查机制，并把正当程序纳入争议策略。",
                 )
 
-                knowledge_graph.build(vault)
+                with (
+                    mock.patch.object(
+                        personal_context,
+                        "CONTEXT_PATH",
+                        root / "context" / "ai-context.json",
+                    ),
+                    mock.patch.object(
+                        personal_context,
+                        "WATCHER_STATE_PATH",
+                        root / "wechat-history-state.json",
+                    ),
+                    mock.patch.object(
+                        personal_context,
+                        "PREFERENCE_PATH",
+                        root / "quality-preferences.json",
+                    ),
+                ):
+                    knowledge_graph.build(vault)
                 results = knowledge_graph.search(
                     "海外投资 东道国审查 正当程序",
                     limit=2,
@@ -191,7 +210,24 @@ publish_date: 2024-01-01
                     """,
                 )
 
-                report = knowledge_graph.build(vault)
+                with (
+                    mock.patch.object(
+                        personal_context,
+                        "CONTEXT_PATH",
+                        root / "context" / "ai-context.json",
+                    ),
+                    mock.patch.object(
+                        personal_context,
+                        "WATCHER_STATE_PATH",
+                        root / "wechat-history-state.json",
+                    ),
+                    mock.patch.object(
+                        personal_context,
+                        "PREFERENCE_PATH",
+                        root / "quality-preferences.json",
+                    ),
+                ):
+                    report = knowledge_graph.build(vault)
 
                 self.assertEqual(report["article_count"], 2)
                 self.assertEqual(report["core_article_count"], 2)

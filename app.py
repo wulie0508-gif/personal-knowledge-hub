@@ -612,7 +612,411 @@ def reconcile_empty_wechat_jobs() -> None:
                 }
                 job["warnings"] = [
                     warning
-         …3667 tokens truncated…b": updated, "preferences": preferences}
+                    for warning in list(job.get("warnings") or [])
+                    if "微信未返回正文" not in str(warning)
+                    and "仅保存元数据" not in str(warning)
+                ]
+                if was_incomplete:
+                    job["message"] = "正文已恢复并写入 Obsidian"
+                    job["updated_at"] = now_iso()
+                changed = True
+                continue
+            if (
+                job.get("kind") == "wechat_mp"
+                and job.get("status") == "complete"
+                and "body_length" in details
+                and int(details.get("body_length") or 0) == 0
+            ):
+                warning = "已保存标题和原文链接，但微信未返回正文；可能是旧链接或访问受限。"
+                warnings = list(job.get("warnings") or [])
+                if warning not in warnings:
+                    warnings.append(warning)
+                job["status"] = "attention"
+                job["message"] = "仅保存元数据，正文未获取"
+                job["warnings"] = warnings
+                job["updated_at"] = now_iso()
+                changed = True
+        if changed:
+            save_jobs(jobs)
+
+
+def repair_wechat_job_titles() -> None:
+    try:
+        import knowledge_pipeline
+
+        titles = {
+            knowledge_pipeline.history_source.canonical_article_url(item.source_url): item.title
+            for item in knowledge_pipeline.current_results_from_notes()
+            if item.source_url and item.title
+        }
+        with STORE_LOCK:
+            jobs = load_jobs()
+            changed = False
+            for job in jobs:
+                if job.get("kind") != "wechat_mp":
+                    continue
+                canonical = knowledge_pipeline.history_source.canonical_article_url(
+                    str(job.get("url") or "")
+                )
+                correct_title = titles.get(canonical)
+                if correct_title and job.get("title") != correct_title:
+                    job["title"] = correct_title
+                    changed = True
+            if changed:
+                save_jobs(jobs)
+    except Exception:
+        return
+
+
+def regenerate_knowledge_views() -> dict[str, Any]:
+    import knowledge_graph
+    import knowledge_pipeline
+
+    current = knowledge_pipeline.current_results_from_notes()
+    graph = knowledge_graph.build(vault_path(), quality_feedback.summary())
+    knowledge_pipeline.write_index(current)
+    report = knowledge_pipeline.scan_vault()
+    report["graph"] = graph
+    knowledge_pipeline.write_report(report, current)
+    return report
+
+
+def refresh_trash_learning(force: bool = False) -> dict[str, Any]:
+    with TRASH_LEARNING_LOCK:
+        elapsed = time.monotonic() - float(
+            TRASH_LEARNING_STATE.get("last_scan_monotonic") or 0
+        )
+        if not force and elapsed < 60:
+            return dict(TRASH_LEARNING_STATE.get("last_result") or {})
+        paths = [TRASH_DIR, vault_path() / ".trash"]
+        result = quality_feedback.ingest_trash_history(paths)
+        TRASH_LEARNING_STATE.update(
+            last_scan_monotonic=time.monotonic(),
+            last_result=result,
+        )
+        return result
+
+
+def knowledge_item_for_job(job: dict[str, Any]) -> Any:
+    import knowledge_pipeline
+
+    canonical = knowledge_pipeline.history_source.canonical_article_url(
+        str(job.get("url") or "")
+    )
+    for item in knowledge_pipeline.current_results_from_notes():
+        if (
+            knowledge_pipeline.history_source.canonical_article_url(
+                item.source_url
+            )
+            == canonical
+        ):
+            return item
+    return None
+
+
+def enrich_jobs_with_knowledge(
+    jobs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    import knowledge_pipeline
+
+    items = {
+        knowledge_pipeline.history_source.canonical_article_url(item.source_url): item
+        for item in knowledge_pipeline.current_results_from_notes()
+        if item.source_url
+    }
+    enriched: list[dict[str, Any]] = []
+    for original in jobs:
+        job = original.copy()
+        canonical = knowledge_pipeline.history_source.canonical_article_url(
+            str(job.get("url") or "")
+        )
+        item = items.get(canonical)
+        if item:
+            job["quality"] = {
+                "score": item.quality_score,
+                "tier": item.quality_tier,
+                "category": item.category,
+                "account": item.account,
+                "flags": item.quality_flags,
+                "preference_adjustment": item.preference_adjustment,
+                "preference_reasons": item.preference_reasons,
+                "knowledge_type": item.knowledge_type,
+                "knowledge_value_score": item.knowledge_value_score,
+                "knowledge_priority": item.knowledge_priority,
+                "mastery_status": item.mastery_status,
+            }
+        else:
+            note_path = Path(str(job.get("output_file") or ""))
+            if note_path.is_file() and note_path.suffix.lower() == ".md":
+                text = note_path.read_text(encoding="utf-8", errors="replace")
+                value_score = int(
+                    knowledge_pipeline.frontmatter_field(
+                        text, "knowledge_value_score"
+                    )
+                    or 0
+                )
+                quality_score = int(
+                    knowledge_pipeline.frontmatter_field(text, "quality_score")
+                    or value_score
+                )
+                tier = (
+                    "高"
+                    if quality_score >= 75
+                    else "中"
+                    if quality_score >= 50
+                    else "低"
+                )
+                job["quality"] = {
+                    "score": quality_score,
+                    "tier": tier,
+                    "category": (
+                        knowledge_pipeline.frontmatter_field(text, "category")
+                        or "其他"
+                    ),
+                    "account": (
+                        knowledge_pipeline.frontmatter_field(text, "account")
+                        or knowledge_pipeline.frontmatter_field(text, "author")
+                    ),
+                    "flags": [],
+                    "preference_adjustment": 0,
+                    "preference_reasons": [],
+                    "knowledge_type": knowledge_pipeline.frontmatter_field(
+                        text, "knowledge_type"
+                    ),
+                    "knowledge_value_score": value_score,
+                    "knowledge_priority": knowledge_pipeline.frontmatter_field(
+                        text, "knowledge_priority"
+                    ),
+                    "mastery_status": (
+                        knowledge_pipeline.frontmatter_field(
+                            text, "mastery_status"
+                        )
+                        or "未学习"
+                    ),
+                }
+        enriched.append(job)
+    return enriched
+
+
+def move_job_article_to_trash(
+    job: dict[str, Any],
+    *,
+    record_user_feedback: bool,
+) -> dict[str, Any]:
+    import knowledge_pipeline
+
+    item = knowledge_item_for_job(job)
+    title = str(getattr(item, "title", "") or job.get("title") or "未命名文章")
+    account = str(getattr(item, "account", "") or "")
+    category = str(getattr(item, "category", "") or "其他")
+    source_url = str(getattr(item, "source_url", "") or job.get("url") or "")
+    if record_user_feedback:
+        quality_feedback.record_feedback(
+            url=source_url,
+            title=title,
+            account=account,
+            category=category,
+            label="remove",
+        )
+
+    item_id = knowledge_pipeline.article_id(source_url)
+    batch = (
+        TRASH_DIR
+        / datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+        / item_id
+    )
+    moved: list[str] = []
+    note_candidates: list[Path] = []
+    if item and item.note_path:
+        note_candidates.append(Path(item.note_path))
+    output_file = Path(str(job.get("output_file") or ""))
+    if str(output_file) and output_file.is_file():
+        note_candidates.append(output_file)
+
+    wechat_root = knowledge_pipeline.WECHAT_ROOT.resolve()
+    for note in dict.fromkeys(note_candidates):
+        resolved = note.resolve()
+        if not resolved.is_file() or wechat_root not in resolved.parents:
+            continue
+        relative = resolved.relative_to(wechat_root)
+        destination = batch / "notes" / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(resolved), str(destination))
+        moved.append(str(destination))
+
+    asset_folder = (knowledge_pipeline.ASSET_ROOT / item_id).resolve()
+    if asset_folder.is_dir() and knowledge_pipeline.ASSET_ROOT.resolve() in asset_folder.parents:
+        asset_destination = batch / "assets" / item_id
+        asset_destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(asset_folder), str(asset_destination))
+        moved.append(str(asset_destination))
+
+    report = regenerate_knowledge_views()
+    return {
+        "title": title,
+        "trash_path": str(batch),
+        "moved": moved,
+        "validation": report.get("status"),
+    }
+
+
+def update_jobs_for_url(url: str, **changes: Any) -> dict[str, Any] | None:
+    import knowledge_pipeline
+
+    canonical = knowledge_pipeline.history_source.canonical_article_url(url)
+    latest: dict[str, Any] | None = None
+    with STORE_LOCK:
+        jobs = load_jobs()
+        for job in jobs:
+            job_canonical = (
+                knowledge_pipeline.history_source.canonical_article_url(
+                    str(job.get("url") or "")
+                )
+            )
+            if canonical and job_canonical == canonical:
+                job.update(changes)
+                job["updated_at"] = now_iso()
+                latest = job.copy()
+        save_jobs(jobs)
+    return latest
+
+
+def mark_knowledge_state(job: dict[str, Any], label: str) -> dict[str, Any]:
+    import knowledge_pipeline
+    import refresh_knowledge_value
+
+    item = knowledge_item_for_job(job)
+    if not item or not item.note_path:
+        raise ValueError("文章笔记不存在")
+    note = Path(item.note_path)
+    text = note.read_text(encoding="utf-8", errors="replace")
+    text = re.sub(
+        r"\n?<!-- user-knowledge-state:start -->.*?<!-- user-knowledge-state:end -->\n?",
+        "\n",
+        text,
+        flags=re.DOTALL,
+    )
+    if label == "focus":
+        text = refresh_knowledge_value.replace_frontmatter(
+            text,
+            "knowledge_priority",
+            "重点",
+        )
+        text = refresh_knowledge_value.replace_frontmatter(
+            text,
+            "priority_override",
+            True,
+        )
+        state_block = "\n".join(
+            [
+                "<!-- user-knowledge-state:start -->",
+                "> [!important] 我标记的重点",
+                "> 这篇内容值得长期保留，并优先用于后续 AI 回答和知识关联。",
+                "<!-- user-knowledge-state:end -->",
+            ]
+        )
+        target = (
+            knowledge_pipeline.ARTICLE_ROOT
+            / "重点知识"
+            / knowledge_pipeline.safe_name(item.category, 30)
+            / note.name
+        )
+    else:
+        text = refresh_knowledge_value.replace_frontmatter(
+            text,
+            "mastery_status",
+            "已学会",
+        )
+        text = refresh_knowledge_value.replace_frontmatter(
+            text,
+            "reviewed_at",
+            now_iso(),
+        )
+        state_block = "\n".join(
+            [
+                "<!-- user-knowledge-state:start -->",
+                "> [!success] 已学会",
+                "> 已完成阅读和吸收；保留为可检索的长期知识，不再作为待处理内容。",
+                "<!-- user-knowledge-state:end -->",
+            ]
+        )
+        target = note
+    if "## 正文" in text:
+        text = text.replace("## 正文", state_block + "\n\n## 正文", 1)
+    else:
+        text += "\n\n" + state_block
+    target.parent.mkdir(parents=True, exist_ok=True)
+    text = refresh_knowledge_value.rewrite_image_links(
+        text,
+        note.parent,
+        target.parent,
+    )
+    target.write_text(text.rstrip() + "\n", encoding="utf-8")
+    if target.resolve() != note.resolve() and note.is_file():
+        note.unlink()
+    quality_feedback.record_feedback(
+        url=item.source_url,
+        title=item.title,
+        account=item.account,
+        category=item.category,
+        label="keep",
+    )
+    report = regenerate_knowledge_views()
+    return {
+        "title": item.title,
+        "note_path": str(target),
+        "validation": report.get("status"),
+    }
+
+
+def apply_job_feedback(job_id: str, label: str) -> dict[str, Any]:
+    if label not in {"keep", "focus", "mastered", "remove"}:
+        raise ValueError("无效的知识反馈")
+    job = find_job(job_id)
+    if not job:
+        raise ValueError("任务不存在")
+    if job.get("kind") != "wechat_mp":
+        raise ValueError("当前只对微信公众号文章学习质量偏好")
+    if job.get("feedback") == label:
+        return {"ok": True, "job": job, "unchanged": True}
+
+    item = knowledge_item_for_job(job)
+    title = str(getattr(item, "title", "") or job.get("title") or "")
+    account = str(getattr(item, "account", "") or "")
+    category = str(getattr(item, "category", "") or "其他")
+    source_url = str(getattr(item, "source_url", "") or job.get("url") or "")
+    if label in {"focus", "mastered"}:
+        state = mark_knowledge_state(job, label)
+        updated = update_jobs_for_url(
+            source_url,
+            feedback=label,
+            message=(
+                "已标记为重点，并用于学习你的偏好"
+                if label == "focus"
+                else "已标记为学会；保留为长期检索知识"
+            ),
+            output_file=state["note_path"],
+        )
+        return {
+            "ok": True,
+            "job": updated,
+            "state": state,
+            "preferences": quality_feedback.summary(),
+        }
+    if label == "keep":
+        preferences = quality_feedback.record_feedback(
+            url=source_url,
+            title=title,
+            account=account,
+            category=category,
+            label="keep",
+        )
+        updated = update_jobs_for_url(
+            source_url,
+            feedback="keep",
+            message="已保留；这次选择已用于学习你的偏好",
+        )
+        return {"ok": True, "job": updated, "preferences": preferences}
 
     removal = move_job_article_to_trash(job, record_user_feedback=True)
     updated = update_jobs_for_url(
@@ -747,6 +1151,7 @@ def community_plugins() -> list[str]:
 def system_status() -> dict[str, Any]:
     import codex_ocr_queue
     import codex_curation_queue
+    import personal_context
 
     refresh_trash_learning()
     config = load_config()
@@ -836,6 +1241,7 @@ def system_status() -> dict[str, Any]:
             "trash_path": str(TRASH_DIR),
             "graph": graph,
             "curation": curation,
+            "personal_context": personal_context.status(),
         },
     }
 
@@ -915,6 +1321,48 @@ class Handler(BaseHTTPRequestHandler):
                     "scope": scope,
                     "results": knowledge_graph.search(query, scope=scope),
                 }
+            )
+            return
+        if parsed.path == "/api/context":
+            import personal_context
+
+            params = urllib.parse.parse_qs(parsed.query)
+            try:
+                max_chars = int(
+                    params.get(
+                        "max_chars",
+                        [str(personal_context.DEFAULT_MAX_CHARS)],
+                    )[0]
+                )
+            except ValueError:
+                self.send_json({"error": "max_chars must be an integer"}, 400)
+                return
+            self.send_json(
+                personal_context.get_agent_context(max_chars=max_chars)
+            )
+            return
+        if parsed.path == "/api/recall":
+            import knowledge_graph
+
+            params = urllib.parse.parse_qs(parsed.query)
+            query = str(params.get("q", [""])[0]).strip()
+            if not query:
+                self.send_json({"error": "q is required"}, 400)
+                return
+            try:
+                limit = int(params.get("limit", ["8"])[0])
+            except ValueError:
+                self.send_json({"error": "limit must be an integer"}, 400)
+                return
+            include_evidence = str(
+                params.get("include_evidence", ["false"])[0]
+            ).casefold() in {"1", "true", "yes", "on"}
+            self.send_json(
+                knowledge_graph.recall(
+                    query,
+                    limit=limit,
+                    include_evidence=include_evidence,
+                )
             )
             return
         path = parsed.path if parsed.path != "/" else "/index.html"
@@ -1009,6 +1457,8 @@ class Handler(BaseHTTPRequestHandler):
                     "url": url,
                     "kind": classify(url),
                     "route": route,
+                    "source": str(payload.get("source") or "manual"),
+                    "observed_at": str(payload.get("observed_at") or ""),
                     "subscribe": bool(payload.get("subscribe")),
                     "interval": int(payload.get("interval") or 360),
                     "since": str(payload.get("since") or datetime.now().date().isoformat()),
@@ -1077,12 +1527,26 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json({"ok": True, "job": job}, 202)
 
 
+def validate_local_host(host: str) -> str:
+    value = str(host or "").strip().casefold()
+    if value not in {"127.0.0.1", "localhost", "::1"}:
+        raise ValueError(
+            "Personal Knowledge Hub is local-only; bind it to 127.0.0.1, "
+            "localhost, or ::1."
+        )
+    return value
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="本地 Obsidian 个人知识入口")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=load_config()["port"])
     parser.add_argument("--no-browser", action="store_true")
     args = parser.parse_args()
+    try:
+        validate_local_host(args.host)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     if not CONFIG_PATH.exists():
