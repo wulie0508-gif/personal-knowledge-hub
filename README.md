@@ -2,13 +2,10 @@
 
 # Personal Knowledge Hub
 
-### 先让 AI 懂你，再让它按需回忆
-
-**A local-first memory layer that gives AI a compact understanding of you, then retrieves detailed, citable memories only when needed.**
+**Local-first context and citable recall for people and AI agents.**
 
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![SQLite](https://img.shields.io/badge/SQLite-FTS5-003B57?logo=sqlite&logoColor=white)](https://www.sqlite.org/)
-[![Obsidian](https://img.shields.io/badge/Obsidian-Knowledge%20Graph-7C3AED?logo=obsidian&logoColor=white)](https://obsidian.md/)
 [![Local First](https://img.shields.io/badge/Privacy-Local--First-16A34A)](#privacy--隐私边界)
 [![License](https://img.shields.io/badge/License-MIT-F59E0B.svg)](LICENSE)
 
@@ -16,11 +13,17 @@
 
 ![Personal Knowledge Hub knowledge graph](static/screenshots/knowledge-graph-overview.jpg)
 
-> **一句话价值**
->
-> 把本人写作、明确反馈与本地阅读轨迹，自动压缩成 AI 每次都能先读的小型个人上下文；当你问“我当时怎么想”时，再进入带时间与引用的详细记忆检索。
+Personal Knowledge Hub keeps personal writing, reading signals, professional
+research, and private source archives in separate governed corpora. It assembles
+a compact context for routine agent work, then retrieves time-stamped,
+source-linked memories only when requested.
 
-它不是把公众号文章堆成一个更大的语料库，也不会因为你点开一篇文章就推断你赞同它。它把“了解你”和“查资料”拆成两条边界清晰、成本不同的路径。
+> 将个人表达、阅读信号与研究资料分开治理，为 Agent 提供紧凑上下文，并在需要时返回带时间与来源的记忆。
+
+Opening or saving an article is not treated as agreement, knowledge, or
+authorship. The project keeps those distinctions explicit so an agent can
+understand the user without confusing external material with the user's own
+views.
 
 ## The two-lane design / 双层记忆架构
 
@@ -60,15 +63,15 @@ flowchart LR
 
 ## Features / 已实现能力
 
-- 🧠 **Compact AI Context** — 生成机器可读的个人上下文 JSON 和 Obsidian 可读视图，长度有硬上限。
-- 🕰️ **Temporal Personal Recall** — 回忆本人过去的记录，返回时间、引用和语料身份。
-- 🧭 **Intent-aware Routing** — 区分个人回忆、专业研究与企业事实，不再把所有内容放进同一个排序池。
-- 👀 **Safe Reading Signals** — 本地微信浏览轨迹只表示“看过/关注过”，绝不自动等同于赞同、掌握或作者身份。
-- 🔐 **Corpus Isolation** — `personal_memory`、`professional_reference`、`enterprise_internal`、`authoritative_external`、`source_archive` 五域隔离。
-- 🔎 **Local Retrieval** — SQLite FTS5 全文检索，结果带 namespace、`represents_user` 和 citation。
-- 🕸️ **Governed Knowledge Graph** — Obsidian 双链与概念图谱；跨域关系采用更高阈值，弱相似不会直接写成人格关系。
-- 🧹 **ETL & Curation** — 内容解析、去重、质量打分、AI 整理队列、可恢复清理与 OCR 编排。
-- 🏠 **Local-first Runtime** — 正文、索引、队列、轨迹和偏好默认保存在本机私有运行目录。
+- **Compact AI Context**: 生成机器可读的个人上下文 JSON 和 Obsidian 可读视图，长度有硬上限。
+- **Temporal Personal Recall**: 回忆本人过去的记录，返回时间、引用和语料身份。
+- **Intent-aware Routing**: 区分个人回忆、专业研究与企业事实，不再把所有内容放进同一个排序池。
+- **Safe Reading Signals**: 本地微信浏览轨迹只表示“看过/关注过”，绝不自动等同于赞同、掌握或作者身份。
+- **Corpus Isolation**: `personal_memory`、`professional_reference`、`enterprise_internal`、`authoritative_external`、`source_archive` 五域隔离。
+- **Local Retrieval**: SQLite FTS5 全文检索，结果带 namespace、`represents_user` 和 citation。
+- **Governed Knowledge Graph**: Obsidian 双链与概念图谱；跨域关系采用更高阈值，弱相似不会直接写成人格关系。
+- **ETL & Curation**: 内容解析、去重、质量打分、AI 整理队列、可恢复清理与 OCR 编排。
+- **Local-first Runtime**: 正文、索引、队列、轨迹和偏好默认保存在本机私有运行目录。
 
 > 当前项目提供的是 **Agent retrieval / context gateway**，不是内置大模型聊天产品。生成式回答由调用它的本地 Agent 完成。
 
@@ -249,8 +252,6 @@ personal-knowledge-hub/
 
 <div align="center">
 
-如果这个项目让你重新思考“AI 如何真正了解一个人”，欢迎 ⭐ **Star**、提交 **Issue**，或分享你的本地第二大脑工作流。
-
-**If this helps you build AI that remembers you without owning your data, a Star would mean a lot.**
+Built by [Cassian](https://github.com/wulie0508-gif) for local-first human and agent workflows. Issues and pull requests are welcome.
 
 </div>
